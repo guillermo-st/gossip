@@ -2,7 +2,6 @@ package gossip
 
 import (
 	"errors"
-	"sync"
 )
 
 var ErrBroadcasterClosed = errors.New("broadcaster is already closed and not accepting new subscribers or messages")
@@ -21,9 +20,6 @@ type DefaultBroadcaster[T any] struct {
 	pubStream   chan T
 	done        chan struct{}
 	doneAck     chan struct{}
-	closed      bool
-	closeOnce   sync.Once
-	mu          sync.RWMutex
 }
 
 // NewBroadcaster returns a new instance of the default Broadcaster implementation with the given input buffer length.
@@ -33,6 +29,8 @@ func NewBroadcaster[T any](bufLen int) *DefaultBroadcaster[T] {
 		subStream:   make(chan chan<- T),
 		unSubStream: make(chan chan<- T),
 		pubStream:   make(chan T, bufLen),
+		done:        make(chan struct{}),
+		doneAck:     make(chan struct{}),
 	}
 
 	go b.broadcast()
@@ -45,66 +43,67 @@ Subscribe adds a new subscriber to the broadcaster. All subscribers will receive
 The returned channel shouldn't be closed by the client to prevent panics. Instead, the client should call Unsubscribe() on that channel to remove the subscriber from the broadcaster.
 */
 func (b *DefaultBroadcaster[T]) Subscribe() (chan T, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if b.closed {
+	sub := make(chan T)
+	select {
+	case b.subStream <- sub:
+		return sub, nil
+	case <-b.done:
+		close(sub)
 		return nil, ErrBroadcasterClosed
 	}
-	sub := make(chan T)
-	b.subStream <- sub
-	return sub, nil
 }
 
 // Unsubscribe removes a subscriber (that is, the channel returned by Subscribe()) from the broadcaster so that it no longer receives messages.
 func (b *DefaultBroadcaster[T]) Unsubscribe(sub chan<- T) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if b.closed {
-		return
+	select {
+	case b.unSubStream <- sub:
+	case <-b.done:
 	}
-	b.unSubStream <- sub
 }
 
 // Broadcast sends a message to all subscribers of the broadcaster.
 func (b *DefaultBroadcaster[T]) Broadcast(msg T) error {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if b.closed {
+	select {
+	case b.pubStream <- msg:
+		return nil
+	case <-b.done:
 		return ErrBroadcasterClosed
 	}
-	b.pubStream <- msg
-	return nil
 }
 
 // Close closes the broadcaster and all the channels previously returned by Subscribe().
 func (b *DefaultBroadcaster[T]) Close() {
-	b.closeOnce.Do(func() {
-		b.mu.Lock()
-		defer b.mu.Unlock()
-
+	select {
+	case <-b.done:
+		return
+	default:
 		close(b.done)
-		<-b.doneAck
+	}
 
-		close(b.subStream)
-		close(b.pubStream)
-		close(b.unSubStream)
-		for sub := range b.subscribers {
-			b.removeSubscriber(sub)
-		}
-		b.closed = true
-	})
+	<-b.doneAck
+
+	close(b.subStream)
+	close(b.unSubStream)
+	close(b.pubStream)
 }
 
 func (b *DefaultBroadcaster[T]) broadcast() {
 	for {
 		select {
 		case <-b.done:
+			for sub := range b.subscribers {
+				b.removeSubscriber(sub)
+			}
+
 			close(b.doneAck)
 			return
+
 		case sub := <-b.subStream:
 			b.subscribers[sub] = struct{}{}
+
 		case sub := <-b.unSubStream:
 			b.removeSubscriber(sub)
+
 		case msg := <-b.pubStream:
 			for sub := range b.subscribers {
 				sub <- msg
