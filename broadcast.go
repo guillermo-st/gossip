@@ -8,8 +8,7 @@ import (
 var ErrBroadcasterClosed = errors.New("broadcaster is already closed and not accepting new subscribers or messages")
 
 type Broadcaster[T any] interface {
-	Subscribe() (chan T, error)
-	Unsubscribe(chan T)
+	Subscribe() (Subscription[T], error)
 	Broadcast(T) error
 	Close()
 }
@@ -25,7 +24,7 @@ type DefaultBroadcaster[T any] struct {
 	subBufLen      int
 }
 
-// NewBroadcaster returns a new instance of the default Broadcaster implementation with the given input buffer length.
+// NewBroadcaster returns a new instance of the default Broadcaster implementation with the given input buffer length, subscriber (output) buffer length, and a timeout for slow subscribers.
 func NewBroadcaster[T any](broadcastBufLen, subBufLen int, subSendTimeout time.Duration) *DefaultBroadcaster[T] {
 	b := &DefaultBroadcaster[T]{
 		subscribers:    make(map[chan<- T]struct{}),
@@ -43,26 +42,20 @@ func NewBroadcaster[T any](broadcastBufLen, subBufLen int, subSendTimeout time.D
 	return b
 }
 
-/*
-Subscribe adds a new subscriber to the broadcaster. All subscribers will receive messages published to the broadcaster.
-The returned channel shouldn't be closed by the client to prevent panics. Instead, the client should call Unsubscribe() on that channel to remove the subscriber from the broadcaster.
-*/
-func (b *DefaultBroadcaster[T]) Subscribe() (chan T, error) {
+// Subscribe adds a new subscriber to the broadcaster and returns the corresponding Subscription to read from. All subscribers will receive messages published to the broadcaster.
+func (b *DefaultBroadcaster[T]) Subscribe() (Subscription[T], error) {
 	sub := make(chan T, b.subBufLen)
 	select {
 	case b.subStream <- sub:
-		return sub, nil
+		return &defaultSubscription[T]{
+			channel: sub,
+			close: func() {
+				b.unsubscribe(sub)
+			},
+		}, nil
 	case <-b.done:
 		close(sub)
 		return nil, ErrBroadcasterClosed
-	}
-}
-
-// Unsubscribe removes a subscriber (that is, the channel returned by Subscribe()) from the broadcaster so that it no longer receives messages.
-func (b *DefaultBroadcaster[T]) Unsubscribe(sub chan T) {
-	select {
-	case b.unSubStream <- sub:
-	case <-b.done:
 	}
 }
 
@@ -90,6 +83,14 @@ func (b *DefaultBroadcaster[T]) Close() {
 	close(b.subStream)
 	close(b.unSubStream)
 	close(b.pubStream)
+}
+
+// unsubscribe removes a subscriber (that is, the channel returned by Subscribe()) from the broadcaster so that it no longer receives messages.
+func (b *DefaultBroadcaster[T]) unsubscribe(sub chan T) {
+	select {
+	case b.unSubStream <- sub:
+	case <-b.done:
+	}
 }
 
 func (b *DefaultBroadcaster[T]) broadcast() {
